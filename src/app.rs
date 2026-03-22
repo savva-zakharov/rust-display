@@ -59,6 +59,16 @@ impl App {
         let window = Arc::new(Window::new(event_loop).unwrap());
         window.set_title("360° Panorama Viewer");
 
+        // Set window icon
+        let icon_bytes = include_bytes!("../icons/app_icon.png");
+        if let Ok(icon_image) = image::load_from_memory(icon_bytes) {
+            let icon_rgba = icon_image.to_rgba8();
+            let (width, height) = icon_rgba.dimensions();
+            if let Ok(icon) = winit::window::Icon::from_rgba(icon_rgba.into_raw(), width, height) {
+                window.set_window_icon(Some(icon));
+            }
+        }
+
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
