@@ -1,5 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use half::f16;
+use image::GenericImageView;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wgpu::TextureFormat;
@@ -123,7 +124,7 @@ struct App {
 impl App {
     async fn new(event_loop: &EventLoop<()>) -> Self {
         let window = Arc::new(Window::new(event_loop).unwrap());
-        window.set_title("360° Panorama Viewer - Press 'O' to open");
+        window.set_title("360° Panorama Viewer - Press 'O' to open image");
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -363,31 +364,58 @@ impl App {
     }
 
     fn load_image(&mut self, path: &PathBuf) {
-        let Ok(img) = image::open(path) else {
-            eprintln!("Failed to open image");
-            return;
-        };
-        
-        // Convert to RGBA32F for HDR support (handles f16, f32, and LDR formats)
-        let rgba32f = img.to_rgba32f();
-        let (w, h) = rgba32f.dimensions();
-        
-        const HM: u32 = 8192;
-        let (hw, data) = if w > HM * 2 {
-            let s = (HM * 2) as f32 / w as f32;
-            let (nw, nh) = ((w as f32 * s) as u32, (h as f32 * s) as u32);
-            (
-                (nw / 2),
-                image::imageops::resize(&rgba32f, nw, nh, image::imageops::FilterType::Lanczos3),
-            )
-        } else {
-            (w / 2, rgba32f)
+        // Use ImageReader for better control over large images
+        let img = match image::ImageReader::open(path) {
+            Ok(reader) => {
+                let mut reader = reader.with_guessed_format().unwrap();
+                // Disable memory limit for large HDR images
+                reader.no_limits();
+                match reader.decode() {
+                    Ok(img) => img,
+                    Err(e) => {
+                        eprintln!("Failed to decode image: {}", e);
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to open image file: {}", e);
+                return;
+            }
         };
 
-        let left = image::imageops::crop_imm(&data, 0, 0, hw, h).to_image();
-        let right = image::imageops::crop_imm(&data, hw, 0, hw, h).to_image();
+        let (orig_w, orig_h) = img.dimensions();
+        println!("Original image size: {}x{}", orig_w, orig_h);
+
+        const HM: u32 = 8192;
+        const MAX_WIDTH: u32 = HM * 2;
+
+        // Resize before conversion if needed to save memory
+        let img = if orig_w > MAX_WIDTH {
+            let s = MAX_WIDTH as f32 / orig_w as f32;
+            let (nw, nh) = ((orig_w as f32 * s) as u32, (orig_h as f32 * s) as u32);
+            println!("Resizing to {}x{} before conversion", nw, nh);
+            img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+
+        let (w, h) = img.dimensions();
+
+        // Convert to RGBA32F for HDR support (handles f16, f32, and LDR formats)
+        let rgba32f = img.to_rgba32f();
+
+        let hw = w / 2;
+
+        let left = image::imageops::crop_imm(&rgba32f, 0, 0, hw, h).to_image();
+        let right = image::imageops::crop_imm(&rgba32f, hw, 0, hw, h).to_image();
         println!("Loaded: {}x{} → two {}x{} textures", w, h, hw, h);
         self.upload_hdr(&left, &right, hw, h);
+
+        // Update window title with filename
+        if let Some(file_name) = path.file_name() {
+            self.window.set_title(&file_name.to_string_lossy());
+        }
     }
 
     fn upload_hdr(
@@ -551,15 +579,6 @@ impl App {
             0,
             bytemuck::cast_slice(&[self.uniforms]),
         );
-        self.window.set_title(&format!(
-            "360° Panorama - Yaw: {:.1}° | Pitch: {:.1}° | FOV: {:.1}° | Exp: {:+.1} EV ({:.1}x) | Gamma: {:.2}",
-            self.uniforms.yaw.to_degrees(),
-            self.uniforms.pitch.to_degrees(),
-            self.uniforms.fov,
-            self.uniforms.exposure,
-            2.0_f32.powf(self.uniforms.exposure),
-            self.uniforms.gamma
-        ));
     }
 
     fn render(&mut self) {
@@ -728,12 +747,11 @@ impl App {
                                     ui.label("Exposure:");
                                     let mut exposure = self.uniforms.exposure;
                                     if ui
-                                        .add(egui::Slider::new(&mut exposure, -15.0..=15.0).suffix(" EV"))
+                                        .add(egui::Slider::new(&mut exposure, -10.0..=10.0).suffix(" EV"))
                                         .changed()
                                     {
                                         new_exposure = Some(exposure);
                                     }
-                                    ui.label(format!("({:.1}x)", 2.0_f32.powf(exposure)));
                                     ui.separator();
                                     ui.label("Gamma:");
                                     let mut gamma = self.uniforms.gamma;
@@ -744,11 +762,20 @@ impl App {
                                         new_gamma = Some(gamma);
                                     }
                                     if self.image_loaded {
+                                        let mut yaw = String::from( self.uniforms.yaw.to_degrees().round().to_string());
+                                        while yaw.len() < 6 {
+                                            yaw =  " ".to_string() + &yaw;
+                                        }
+                                        let mut pitch = String::from(self.uniforms.pitch.to_degrees().round().to_string());
+                                        while pitch.len() < 6 {
+                                            pitch =  " ".to_string() + &pitch;
+                                        }
+
                                         ui.separator();
                                         ui.label(format!(
-                                            "Yaw: {:.0}° | Pitch: {:.0}°",
-                                            self.uniforms.yaw.to_degrees(),
-                                            self.uniforms.pitch.to_degrees()
+                                            "Yaw: {}° | Pitch: {}°",
+                                            yaw,
+                                            pitch
                                         ));
                                     }
                                 });
@@ -838,13 +865,13 @@ fn main() {
                                 //Comma, Period,  Semicolon, Quote
                                 PhysicalKey::Code(KeyCode::Comma) => {
                                     if !app.egui_ctx.wants_keyboard_input() {
-                                        app.uniforms.exposure = (app.uniforms.exposure - 0.5).max(-15.0);
+                                        app.uniforms.exposure = (app.uniforms.exposure - 0.5).max(-10.0);
                                         app.update_uniforms();
                                     }
                                 }
                                 PhysicalKey::Code(KeyCode::Period) => {
                                     if !app.egui_ctx.wants_keyboard_input() {
-                                        app.uniforms.exposure = (app.uniforms.exposure + 0.5).min(15.0);
+                                        app.uniforms.exposure = (app.uniforms.exposure + 0.5).min(10.0);
                                         app.update_uniforms();
                                     }
                                 }
