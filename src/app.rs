@@ -19,16 +19,12 @@ pub struct App {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
-    texture1: Option<wgpu::Texture>,
-    texture1_view: Option<wgpu::TextureView>,
-    texture2: Option<wgpu::Texture>,
-    texture2_view: Option<wgpu::TextureView>,
+    panorama_texture: Option<wgpu::Texture>,
+    panorama_view: Option<wgpu::TextureView>,
     sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
-    bind_group0: Option<wgpu::BindGroup>,
-    bind_group1: Option<wgpu::BindGroup>,
-    bgl0: wgpu::BindGroupLayout,
-    bgl1: wgpu::BindGroupLayout,
+    bind_group: Option<wgpu::BindGroup>,
+    bgl: wgpu::BindGroupLayout,
     surface_format: TextureFormat,
     pub uniforms: Uniforms,
     pub is_dragging: bool,
@@ -45,8 +41,8 @@ pub struct App {
     egui_shapes: Vec<egui::epaint::ClippedShape>,
     egui_pixels_per_point: f32,
     pub is_loading: bool,
-    image_sender: Sender<Result<(Vec<u16>, Vec<u16>, u32, u32, PathBuf), String>>,
-    image_receiver: Receiver<Result<(Vec<u16>, Vec<u16>, u32, u32, PathBuf), String>>,
+    image_sender: Sender<Result<(Vec<u16>, u32, u32, PathBuf), String>>,
+    image_receiver: Receiver<Result<(Vec<u16>, u32, u32, PathBuf), String>>,
     pub capture_path: Option<PathBuf>,
 }
 
@@ -76,12 +72,18 @@ impl App {
             .await
             .expect("No adapter");
 
+        // Request high limits
+        let mut limits = wgpu::Limits::default();
+        let adapter_limits = adapter.limits();
+        limits.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d;
+        println!("Adapter max texture size: {}", limits.max_texture_dimension_2d);
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: limits,
                 },
                 None,
             )
@@ -98,7 +100,7 @@ impl App {
             label: Some("Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_u: wgpu::AddressMode::Repeat, // Panoramic repeat
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
@@ -125,8 +127,8 @@ impl App {
         });
         let pv = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("BGL0"),
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("BGL"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -156,31 +158,10 @@ impl App {
                 },
             ],
         });
-        let bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("BGL1"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
 
-        let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BG0"),
-            layout: &bgl0,
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("BG"),
+            layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -196,24 +177,10 @@ impl App {
                 },
             ],
         });
-        let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BG1"),
-            layout: &bgl1,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&pv),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
 
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PL"),
-            bind_group_layouts: &[&bgl0, &bgl1],
+            bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
         let sf = surface
@@ -266,16 +233,12 @@ impl App {
             device,
             queue,
             pipeline,
-            texture1: None,
-            texture1_view: None,
-            texture2: None,
-            texture2_view: None,
+            panorama_texture: None,
+            panorama_view: None,
             sampler,
             uniform_buffer: ub,
-            bind_group0: Some(bg0),
-            bind_group1: Some(bg1),
-            bgl0,
-            bgl1,
+            bind_group: Some(bg),
+            bgl,
             surface_format: sf,
             uniforms: Uniforms::default(),
             is_dragging: false,
@@ -301,8 +264,9 @@ impl App {
     pub fn start_loading_image(&mut self, path: PathBuf) {
         self.is_loading = true;
         let sender = self.image_sender.clone();
+        let max_size = self.device.limits().max_texture_dimension_2d;
         thread::spawn(move || {
-            let result = App::load_image_data(&path);
+            let result = App::load_image_data(&path, max_size);
             sender.send(result).unwrap();
         });
     }
@@ -312,8 +276,8 @@ impl App {
             if let Ok(result) = self.image_receiver.try_recv() {
                 self.is_loading = false;
                 match result {
-                    Ok((left_f16, right_f16, w, h, path)) => {
-                        self.upload_hdr_from_data(&left_f16, &right_f16, w, h);
+                    Ok((f16_data, w, h, path)) => {
+                        self.upload_hdr_from_data(&f16_data, w, h);
                         if let Some(file_name) = path.file_name() {
                             self.window.set_title(&file_name.to_string_lossy());
                         }
@@ -326,7 +290,7 @@ impl App {
         }
     }
 
-    fn load_image_data(path: &PathBuf) -> Result<(Vec<u16>, Vec<u16>, u32, u32, PathBuf), String> {
+    fn load_image_data(path: &PathBuf, max_size: u32) -> Result<(Vec<u16>, u32, u32, PathBuf), String> {
         let img = match image::ImageReader::open(path) {
             Ok(reader) => {
                 let mut reader = reader.with_guessed_format().unwrap();
@@ -342,13 +306,12 @@ impl App {
         let (orig_w, orig_h) = img.dimensions();
         println!("Original image size: {}x{}", orig_w, orig_h);
 
-        const HM: u32 = 8192;
-        const MAX_WIDTH: u32 = HM * 2;
-
-        let img = if orig_w > MAX_WIDTH {
-            let s = MAX_WIDTH as f32 / orig_w as f32;
+        let img = if orig_w > max_size || orig_h > max_size {
+            let s_w = max_size as f32 / orig_w as f32;
+            let s_h = max_size as f32 / orig_h as f32;
+            let s = s_w.min(s_h);
             let (nw, nh) = ((orig_w as f32 * s) as u32, (orig_h as f32 * s) as u32);
-            println!("Resizing to {}x{} before conversion", nw, nh);
+            println!("Resizing to {}x{} (HW limit: {})", nw, nh, max_size);
             img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
         } else {
             img
@@ -356,36 +319,28 @@ impl App {
 
         let (w, h) = img.dimensions();
         let rgba32f = img.to_rgba32f();
-        let hw = w / 2;
 
-        let left = image::imageops::crop_imm(&rgba32f, 0, 0, hw, h).to_image();
-        let right = image::imageops::crop_imm(&rgba32f, hw, 0, hw, h).to_image();
-        println!("Loaded: {}x{} → two {}x{} textures", w, h, hw, h);
+        println!("Loaded: {}x{}", w, h);
 
-        let left_f16: Vec<u16> = left
-            .pixels()
-            .flat_map(|p| p.0.iter().map(|&v| f16::from_f32(v).to_bits()))
-            .collect();
-        let right_f16: Vec<u16> = right
+        let f16_data: Vec<u16> = rgba32f
             .pixels()
             .flat_map(|p| p.0.iter().map(|&v| f16::from_f32(v).to_bits()))
             .collect();
 
-        Ok((left_f16, right_f16, hw, h, path.clone()))
+        Ok((f16_data, w, h, path.clone()))
     }
 
     fn upload_hdr_from_data(
         &mut self,
-        left_f16: &[u16],
-        right_f16: &[u16],
+        f16_data: &[u16],
         w: u32,
         h: u32,
     ) {
         let texture_format = wgpu::TextureFormat::Rgba16Float;
         let bytes_per_pixel = 8;
 
-        self.texture1 = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("T1"),
+        self.panorama_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Panorama Texture"),
             size: wgpu::Extent3d {
                 width: w,
                 height: h,
@@ -398,58 +353,19 @@ impl App {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
-        let t1 = self.texture1.as_ref().unwrap();
-        self.texture1_view = Some(t1.create_view(&wgpu::TextureViewDescriptor::default()));
+        let t = self.panorama_texture.as_ref().unwrap();
+        self.panorama_view = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
 
-        let left_bytes = bytemuck::cast_slice(left_f16);
+        let bytes = bytemuck::cast_slice(f16_data);
 
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: t1,
+                texture: t,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            left_bytes,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_pixel * w),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        self.texture2 = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("T2"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: texture_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        }));
-        let t2 = self.texture2.as_ref().unwrap();
-        self.texture2_view = Some(t2.create_view(&wgpu::TextureViewDescriptor::default()));
-
-        let right_bytes = bytemuck::cast_slice(right_f16);
-
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: t2,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            right_bytes,
+            bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(bytes_per_pixel * w),
@@ -468,20 +384,17 @@ impl App {
 
 
     fn recreate_bind_groups(&mut self) {
-        let Some(t1v) = &self.texture1_view else {
-            return;
-        };
-        let Some(t2v) = &self.texture2_view else {
+        let Some(tv) = &self.panorama_view else {
             return;
         };
 
-        self.bind_group0 = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BG0"),
-            layout: &self.bgl0,
+        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("BG"),
+            layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(t1v),
+                    resource: wgpu::BindingResource::TextureView(tv),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -490,20 +403,6 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: self.uniform_buffer.as_entire_binding(),
-                },
-            ],
-        }));
-        self.bind_group1 = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BG1"),
-            layout: &self.bgl1,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(t2v),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
         }));
@@ -583,8 +482,7 @@ impl App {
             });
             if self.image_loaded {
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, self.bind_group0.as_ref().unwrap(), &[]);
-                pass.set_bind_group(1, self.bind_group1.as_ref().unwrap(), &[]);
+                pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
                 pass.draw(0..6, 0..1);
             }
         }
