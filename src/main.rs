@@ -738,7 +738,7 @@ impl App {
                                     ui.label("FOV:");
                                     let mut fov = self.uniforms.fov;
                                     if ui
-                                        .add(egui::Slider::new(&mut fov, 30.0..=150.0).suffix("°"))
+                                        .add(egui::Slider::new(&mut fov, 5.0..=150.0).suffix("°"))
                                         .changed()
                                     {
                                         new_fov = Some(fov);
@@ -747,7 +747,7 @@ impl App {
                                     ui.label("Exposure:");
                                     let mut exposure = self.uniforms.exposure;
                                     if ui
-                                        .add(egui::Slider::new(&mut exposure, -10.0..=10.0).suffix(" EV"))
+                                        .add(egui::Slider::new(&mut exposure, -30.0..=10.0).suffix(" EV"))
                                         .changed()
                                     {
                                         new_exposure = Some(exposure);
@@ -865,13 +865,13 @@ fn main() {
                                 //Comma, Period,  Semicolon, Quote
                                 PhysicalKey::Code(KeyCode::Comma) => {
                                     if !app.egui_ctx.wants_keyboard_input() {
-                                        app.uniforms.exposure = (app.uniforms.exposure - 0.5).max(-10.0);
+                                        app.uniforms.exposure = (app.uniforms.exposure - 1.0).max(-30.0);
                                         app.update_uniforms();
                                     }
                                 }
                                 PhysicalKey::Code(KeyCode::Period) => {
                                     if !app.egui_ctx.wants_keyboard_input() {
-                                        app.uniforms.exposure = (app.uniforms.exposure + 0.5).min(10.0);
+                                        app.uniforms.exposure = (app.uniforms.exposure + 1.0).min(10.0);
                                         app.update_uniforms();
                                     }
                                 }
@@ -921,7 +921,7 @@ fn main() {
                                 MouseScrollDelta::LineDelta(_, y) => -y * 5.0,
                                 MouseScrollDelta::PixelDelta(p) => -p.y as f32 * 0.05,
                             };
-                            app.uniforms.fov = (app.uniforms.fov + s).clamp(30.0, 150.0);
+                            app.uniforms.fov = (app.uniforms.fov + s).clamp(5.0, 150.0);
                             app.update_uniforms();
                         }
                     }
