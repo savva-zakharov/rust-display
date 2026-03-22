@@ -2573,6 +2573,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "half",
  "image",
  "rfd",
  "tokio",

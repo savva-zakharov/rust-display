@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use half::f16;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wgpu::TextureFormat;
@@ -82,7 +83,7 @@ impl Default for Uniforms {
             fov: 90.0,
             aspect: 1.0,
             exposure: 0.0,
-            gamma: 2.2,
+            gamma: 1.0,
         }
     }
 }
@@ -187,7 +188,7 @@ impl App {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -366,27 +367,40 @@ impl App {
             eprintln!("Failed to open image");
             return;
         };
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
+        
+        // Convert to RGBA32F for HDR support (handles f16, f32, and LDR formats)
+        let rgba32f = img.to_rgba32f();
+        let (w, h) = rgba32f.dimensions();
+        
         const HM: u32 = 8192;
         let (hw, data) = if w > HM * 2 {
             let s = (HM * 2) as f32 / w as f32;
             let (nw, nh) = ((w as f32 * s) as u32, (h as f32 * s) as u32);
             (
                 (nw / 2),
-                image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Lanczos3),
+                image::imageops::resize(&rgba32f, nw, nh, image::imageops::FilterType::Lanczos3),
             )
         } else {
-            (w / 2, rgba)
+            (w / 2, rgba32f)
         };
 
         let left = image::imageops::crop_imm(&data, 0, 0, hw, h).to_image();
         let right = image::imageops::crop_imm(&data, hw, 0, hw, h).to_image();
         println!("Loaded: {}x{} → two {}x{} textures", w, h, hw, h);
-        self.upload(&left, &right, hw, h);
+        self.upload_hdr(&left, &right, hw, h);
     }
 
-    fn upload(&mut self, left: &image::RgbaImage, right: &image::RgbaImage, w: u32, h: u32) {
+    fn upload_hdr(
+        &mut self,
+        left: &image::ImageBuffer<image::Rgba<f32>, Vec<f32>>,
+        right: &image::ImageBuffer<image::Rgba<f32>, Vec<f32>>,
+        w: u32,
+        h: u32,
+    ) {
+        // Use Rgba16Float for HDR textures (good balance of precision and memory)
+        let texture_format = wgpu::TextureFormat::Rgba16Float;
+        let bytes_per_pixel = 8; // 4 channels * 16 bits / 8 = 8 bytes
+
         self.texture1 = Some(self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("T1"),
             size: wgpu::Extent3d {
@@ -397,12 +411,25 @@ impl App {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: texture_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
         let t1 = self.texture1.as_ref().unwrap();
         self.texture1_view = Some(t1.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        // Convert f32 to f16 for upload
+        let left_f16: Vec<u16> = left
+            .pixels()
+            .flat_map(|p| {
+                p.0.iter().map(|&v| {
+                    let f16_val = f16::from_f32(v);
+                    f16_val.to_bits()
+                })
+            })
+            .collect();
+        let left_bytes = bytemuck::cast_slice(&left_f16);
+
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: t1,
@@ -410,10 +437,10 @@ impl App {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            left,
+            left_bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * w),
+                bytes_per_row: Some(bytes_per_pixel * w),
                 rows_per_image: Some(h),
             },
             wgpu::Extent3d {
@@ -433,12 +460,25 @@ impl App {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: texture_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
         let t2 = self.texture2.as_ref().unwrap();
         self.texture2_view = Some(t2.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        // Convert f32 to f16 for upload
+        let right_f16: Vec<u16> = right
+            .pixels()
+            .flat_map(|p| {
+                p.0.iter().map(|&v| {
+                    let f16_val = f16::from_f32(v);
+                    f16_val.to_bits()
+                })
+            })
+            .collect();
+        let right_bytes = bytemuck::cast_slice(&right_f16);
+
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: t2,
@@ -446,10 +486,10 @@ impl App {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            right,
+            right_bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * w),
+                bytes_per_row: Some(bytes_per_pixel * w),
                 rows_per_image: Some(h),
             },
             wgpu::Extent3d {
@@ -794,7 +834,7 @@ fn main() {
                                 PhysicalKey::Code(KeyCode::Space) => {
                                     app.show_controls = !app.show_controls
                                 }
-                                // Exposure controls: , to decrease, . to increase 
+                                // Exposure controls: , to decrease, . to increase
                                 //Comma, Period,  Semicolon, Quote
                                 PhysicalKey::Code(KeyCode::Comma) => {
                                     if !app.egui_ctx.wants_keyboard_input() {
