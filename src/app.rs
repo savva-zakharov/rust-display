@@ -19,11 +19,11 @@ pub struct App {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
-    panorama_texture: Option<wgpu::Texture>,
-    panorama_view: Option<wgpu::TextureView>,
+    panorama_textures: [Option<wgpu::Texture>; 2],
+    panorama_views: [Option<wgpu::TextureView>; 2],
     sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
-    bind_group: Option<wgpu::BindGroup>,
+    bind_groups: [Option<wgpu::BindGroup>; 2],
     bgl: wgpu::BindGroupLayout,
     surface_format: TextureFormat,
     pub uniforms: Uniforms,
@@ -32,7 +32,8 @@ pub struct App {
     pub yaw_start: f32,
     pub pitch_start: f32,
     pub shift_start: f32,
-    image_loaded: bool,
+    pub current_panorama: usize,
+    image_loaded: [bool; 2],
     pub should_close: bool,
     pub egui_ctx: egui::Context,
     pub egui_state: egui_winit::State,
@@ -41,8 +42,8 @@ pub struct App {
     egui_shapes: Vec<egui::epaint::ClippedShape>,
     egui_pixels_per_point: f32,
     pub is_loading: bool,
-    image_sender: Sender<Result<(Vec<u16>, u32, u32, PathBuf), String>>,
-    image_receiver: Receiver<Result<(Vec<u16>, u32, u32, PathBuf), String>>,
+    image_sender: Sender<Result<(Vec<u16>, u32, u32, PathBuf, usize), String>>,
+    image_receiver: Receiver<Result<(Vec<u16>, u32, u32, PathBuf, usize), String>>,
     pub capture_path: Option<PathBuf>,
 }
 
@@ -50,7 +51,7 @@ impl App {
     pub async fn new(event_loop: &EventLoop<()>) -> Self {
         let (tx, rx) = mpsc::channel();
         let window = Arc::new(Window::new(event_loop).unwrap());
-        window.set_title("360° Panorama Viewer - Press 'O' to open image");
+        window.set_title("360° Panorama Viewer");
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -72,7 +73,6 @@ impl App {
             .await
             .expect("No adapter");
 
-        // Request high limits
         let mut limits = wgpu::Limits::default();
         let adapter_limits = adapter.limits();
         limits.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d;
@@ -100,7 +100,7 @@ impl App {
             label: Some("Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            address_mode_u: wgpu::AddressMode::Repeat, // Panoramic repeat
+            address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
@@ -159,8 +159,26 @@ impl App {
             ],
         });
 
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BG"),
+        let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("BG 1"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&pv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ub.as_entire_binding(),
+                },
+            ],
+        });
+        let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("BG 2"),
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -233,11 +251,11 @@ impl App {
             device,
             queue,
             pipeline,
-            panorama_texture: None,
-            panorama_view: None,
+            panorama_textures: [None, None],
+            panorama_views: [None, None],
             sampler,
             uniform_buffer: ub,
-            bind_group: Some(bg),
+            bind_groups: [Some(bg1), Some(bg2)],
             bgl,
             surface_format: sf,
             uniforms: Uniforms::default(),
@@ -246,7 +264,8 @@ impl App {
             yaw_start: 0.0,
             pitch_start: 0.0,
             shift_start: 0.0,
-            image_loaded: false,
+            current_panorama: 0,
+            image_loaded: [false, false],
             should_close: false,
             egui_ctx,
             egui_state,
@@ -261,12 +280,12 @@ impl App {
         }
     }
 
-    pub fn start_loading_image(&mut self, path: PathBuf) {
+    pub fn start_loading_image(&mut self, path: PathBuf, slot: usize) {
         self.is_loading = true;
         let sender = self.image_sender.clone();
         let max_size = self.device.limits().max_texture_dimension_2d;
         thread::spawn(move || {
-            let result = App::load_image_data(&path, max_size);
+            let result = App::load_image_data(&path, max_size, slot);
             sender.send(result).unwrap();
         });
     }
@@ -276,8 +295,8 @@ impl App {
             if let Ok(result) = self.image_receiver.try_recv() {
                 self.is_loading = false;
                 match result {
-                    Ok((f16_data, w, h, path)) => {
-                        self.upload_hdr_from_data(&f16_data, w, h);
+                    Ok((f16_data, w, h, path, slot)) => {
+                        self.upload_hdr_from_data(&f16_data, w, h, slot);
                         if let Some(file_name) = path.file_name() {
                             self.window.set_title(&file_name.to_string_lossy());
                         }
@@ -290,7 +309,7 @@ impl App {
         }
     }
 
-    fn load_image_data(path: &PathBuf, max_size: u32) -> Result<(Vec<u16>, u32, u32, PathBuf), String> {
+    fn load_image_data(path: &PathBuf, max_size: u32, slot: usize) -> Result<(Vec<u16>, u32, u32, PathBuf, usize), String> {
         let img = match image::ImageReader::open(path) {
             Ok(reader) => {
                 let mut reader = reader.with_guessed_format().unwrap();
@@ -304,14 +323,9 @@ impl App {
         };
 
         let (orig_w, orig_h) = img.dimensions();
-        println!("Original image size: {}x{}", orig_w, orig_h);
-
         let img = if orig_w > max_size || orig_h > max_size {
-            let s_w = max_size as f32 / orig_w as f32;
-            let s_h = max_size as f32 / orig_h as f32;
-            let s = s_w.min(s_h);
+            let s = max_size as f32 / orig_w.max(orig_h) as f32;
             let (nw, nh) = ((orig_w as f32 * s) as u32, (orig_h as f32 * s) as u32);
-            println!("Resizing to {}x{} (HW limit: {})", nw, nh, max_size);
             img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
         } else {
             img
@@ -319,33 +333,21 @@ impl App {
 
         let (w, h) = img.dimensions();
         let rgba32f = img.to_rgba32f();
-
-        println!("Loaded: {}x{}", w, h);
-
         let f16_data: Vec<u16> = rgba32f
             .pixels()
             .flat_map(|p| p.0.iter().map(|&v| f16::from_f32(v).to_bits()))
             .collect();
 
-        Ok((f16_data, w, h, path.clone()))
+        Ok((f16_data, w, h, path.clone(), slot))
     }
 
-    fn upload_hdr_from_data(
-        &mut self,
-        f16_data: &[u16],
-        w: u32,
-        h: u32,
-    ) {
+    fn upload_hdr_from_data(&mut self, f16_data: &[u16], w: u32, h: u32, slot: usize) {
         let texture_format = wgpu::TextureFormat::Rgba16Float;
         let bytes_per_pixel = 8;
 
-        self.panorama_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Panorama Texture"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
+        self.panorama_textures[slot] = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Panorama Texture {}", slot)),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -353,112 +355,64 @@ impl App {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
-        let t = self.panorama_texture.as_ref().unwrap();
-        self.panorama_view = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let t = self.panorama_textures[slot].as_ref().unwrap();
+        self.panorama_views[slot] = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
 
         let bytes = bytemuck::cast_slice(f16_data);
-
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: t,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+            wgpu::ImageCopyTexture { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytes,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_pixel * w),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bytes_per_pixel * w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
 
         self.recreate_bind_groups();
-        self.image_loaded = true;
+        self.image_loaded[slot] = true;
+        self.current_panorama = slot;
     }
 
-
     fn recreate_bind_groups(&mut self) {
-        let Some(tv) = &self.panorama_view else {
-            return;
-        };
-
-        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BG"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(tv),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-            ],
-        }));
+        for i in 0..2 {
+            if let Some(tv) = &self.panorama_views[i] {
+                self.bind_groups[i] = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("BG {}", i)),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(tv) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.uniform_buffer.as_entire_binding() },
+                    ],
+                }));
+            }
+        }
     }
 
     pub fn update_uniforms(&mut self) {
-        self.queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[self.uniforms]),
-        );
+        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniforms]));
     }
 
     pub fn render(&mut self) {
         let size = self.window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
+        if size.width == 0 || size.height == 0 { return; }
 
-        // Update aspect ratio
         self.uniforms.aspect = size.width as f32 / size.height as f32;
-        self.queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[self.uniforms]),
-        );
+        self.update_uniforms();
 
         let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
-        if self.capture_path.is_some() {
-            usage |= wgpu::TextureUsages::COPY_SRC;
-        }
+        if self.capture_path.is_some() { usage |= wgpu::TextureUsages::COPY_SRC; }
 
-        self.surface.configure(
-            &self.device,
-            &wgpu::SurfaceConfiguration {
-                usage,
-                format: self.surface_format,
-                width: size.width,
-                height: size.height,
-                present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                view_formats: vec![],
-                desired_maximum_frame_latency: 2,
-            },
-        );
+        self.surface.configure(&self.device, &wgpu::SurfaceConfiguration {
+            usage, format: self.surface_format, width: size.width, height: size.height,
+            present_mode: wgpu::PresentMode::Fifo, alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![], desired_maximum_frame_latency: 2,
+        });
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(_) => return,
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Enc") });
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Enc") });
 
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -467,22 +421,15 @@ impl App {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.15,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.15, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
+                ..Default::default()
             });
-            if self.image_loaded {
+            if self.image_loaded[self.current_panorama] {
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                pass.set_bind_group(0, self.bind_groups[self.current_panorama].as_ref().unwrap(), &[]);
                 pass.draw(0..6, 0..1);
             }
         }
@@ -502,71 +449,26 @@ impl App {
             });
 
             enc.copy_texture_to_buffer(
-                wgpu::ImageCopyTexture {
-                    texture: &frame.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyBuffer {
-                    buffer: &capture_buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded_bytes_per_row),
-                        rows_per_image: Some(size.height),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: size.width,
-                    height: size.height,
-                    depth_or_array_layers: 1,
-                },
+                wgpu::ImageCopyTexture { texture: &frame.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyBuffer { buffer: &capture_buffer, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(padded_bytes_per_row), rows_per_image: Some(size.height) } },
+                wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
             );
             Some((path, capture_buffer, padded_bytes_per_row))
-        } else {
-            None
-        };
+        } else { None };
 
-        // Render egui on top
-        let clipped_primitives = self
-            .egui_ctx
-            .tessellate(self.egui_shapes.clone(), self.egui_pixels_per_point);
-        
-        // Update egui vertex/index buffers
-        self.egui_renderer.update_buffers(
-            &self.device,
-            &self.queue,
-            &mut enc,
-            &clipped_primitives,
-            &egui_wgpu::ScreenDescriptor {
-                size_in_pixels: [size.width, size.height],
-                pixels_per_point: self.egui_pixels_per_point,
-            },
-        );
+        let clipped_primitives = self.egui_ctx.tessellate(self.egui_shapes.clone(), self.egui_pixels_per_point);
+        self.egui_renderer.update_buffers(&self.device, &self.queue, &mut enc, &clipped_primitives, &egui_wgpu::ScreenDescriptor { size_in_pixels: [size.width, size.height], pixels_per_point: self.egui_pixels_per_point });
         
         {
             let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
+                    view: &view, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
+                ..Default::default()
             });
-            self.egui_renderer.render(
-                &mut rpass,
-                &clipped_primitives,
-                &egui_wgpu::ScreenDescriptor {
-                    size_in_pixels: [size.width, size.height],
-                    pixels_per_point: self.egui_pixels_per_point,
-                },
-            );
+            self.egui_renderer.render(&mut rpass, &clipped_primitives, &egui_wgpu::ScreenDescriptor { size_in_pixels: [size.width, size.height], pixels_per_point: self.egui_pixels_per_point });
         }
 
         self.queue.submit(std::iter::once(enc.finish()));
@@ -591,206 +493,94 @@ impl App {
                         let i = (y as usize * padded_bytes_per_row as usize + x as usize * u32_size);
                         let r; let g; let b;
                         match format {
-                            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm => {
-                                r = data[i + 2];
-                                g = data[i + 1];
-                                b = data[i];
-                            }
-                            wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Rgba8Unorm => {
-                                r = data[i];
-                                g = data[i + 1];
-                                b = data[i + 2];
-                            }
-                            _ => {
-                                r = data[i];
-                                g = data[i + 1];
-                                b = data[i + 2];
-                            }
+                            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm => { r = data[i + 2]; g = data[i + 1]; b = data[i]; }
+                            _ => { r = data[i]; g = data[i + 1]; b = data[i + 2]; }
                         }
-                        png_data.push(r);
-                        png_data.push(g);
-                        png_data.push(b);
+                        png_data.push(r); png_data.push(g); png_data.push(b);
                     }
                 }
-                image::save_buffer(
-                    &path,
-                    &png_data,
-                    width,
-                    height,
-                    image::ColorType::Rgb8,
-                ).unwrap();
-                println!("View saved to {:?}", path);
+                image::save_buffer(&path, &png_data, width, height, image::ColorType::Rgb8).unwrap();
             });
         }
-
         frame.present();
     }
 
     pub fn draw_egui(&mut self) {
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let mut load_path: Option<PathBuf> = None;
+        let mut load_path: Option<(PathBuf, usize)> = None;
         let mut reset = false;
         let mut new_fov: Option<f32> = None;
         let mut new_exposure: Option<f32> = None;
         let mut new_gamma: Option<f32> = None;
-
         let mut update_uniforms = false;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if self.is_loading {
-                egui::Area::new(egui::Id::new("loading"))
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.add(egui::Spinner::new());
-                    });
+                egui::Area::new(egui::Id::new("loading")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| { ui.add(egui::Spinner::new()); });
             }
             if self.show_controls {
-                egui::Area::new(egui::Id::new("controls"))
-                    .anchor(egui::Align2::CENTER_TOP, [0.0, 20.0])
-                    .show(ctx, |ui| {
-                        egui::Frame::window(ui.style())
-                            .rounding(20.0)
-                            .shadow(egui::epaint::Shadow {
-                                blur: 10.0,
-                                ..Default::default()
-                            })
-                            .fill(egui::Color32::from_black_alpha(180))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 15.0;
-                                    if ui.button("📁 Open").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new()
-                                            .add_filter(
-                                                "Images",
-                                                &[
-                                                    "png", "jpg", "jpeg", "bmp", "webp", "tif",
-                                                    "tiff", "exr",
-                                                ],
-                                            )
-                                            .pick_file()
-                                        {
-                                            load_path = Some(p);
-                                        }
-                                    }
-                                    if ui.button("⟲ Reset").clicked() {
-                                        reset = true;
-                                    }
-                                    if ui.button("💾 Save").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new()
-                                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
-                                            .set_file_name("view.png")
-                                            .save_file()
-                                        {
-                                            self.capture_path = Some(p);
-                                        }
-                                    }
-                                    ui.separator();
-                                    let mut two_point = self.uniforms.two_point_mode == 1;
-                                    if ui.checkbox(&mut two_point, "2-Point").changed() {
-                                        self.uniforms.two_point_mode = if two_point { 1 } else { 0 };
-                                        if two_point {
-                                            self.uniforms.pitch = 0.0;
-                                        } else {
-                                            self.uniforms.shift = 0.0;
-                                        }
-                                        update_uniforms = true;
-                                    }
-                                    ui.separator();
-                                    ui.label("FOV:");
-                                    let mut fov = self.uniforms.fov;
-                                    if ui
-                                        .add(egui::Slider::new(&mut fov, 5.0..=150.0).suffix("°"))
-                                        .changed()
-                                    {
-                                        new_fov = Some(fov);
-                                    }
-                                    ui.separator();
-                                    ui.label("Exposure:");
-                                    let mut exposure = self.uniforms.exposure;
-                                    if ui
-                                        .add(egui::Slider::new(&mut exposure, -30.0..=10.0).suffix(" EV"))
-                                        .changed()
-                                    {
-                                        new_exposure = Some(exposure);
-                                    }
-                                    ui.separator();
-                                    ui.label("Gamma:");
-                                    let mut gamma = self.uniforms.gamma;
-                                    if ui
-                                        .add(egui::Slider::new(&mut gamma, 0.5..=3.0))
-                                        .changed()
-                                    {
-                                        new_gamma = Some(gamma);
-                                    }
-                                    if self.image_loaded {
-                                        let mut yaw = String::from( self.uniforms.yaw.to_degrees().round().to_string());
-                                        while yaw.len() < 6 {
-                                            yaw =  " ".to_string() + &yaw;
-                                        }
-                                        
-                                        ui.separator();
-                                        if self.uniforms.two_point_mode == 1 {
-                                            ui.label(format!(
-                                                "Yaw: {}° | Shift: {:.2}",
-                                                yaw,
-                                                self.uniforms.shift
-                                            ));
-                                        } else {
-                                            let mut pitch = String::from(self.uniforms.pitch.to_degrees().round().to_string());
-                                            while pitch.len() < 6 {
-                                                pitch =  " ".to_string() + &pitch;
-                                            }
-                                            ui.label(format!(
-                                                "Yaw: {}° | Pitch: {}°",
-                                                yaw,
-                                                pitch
-                                            ));
-                                        }
-                                    }
-                                });
-                            });
+                egui::Area::new(egui::Id::new("controls")).anchor(egui::Align2::CENTER_TOP, [0.0, 20.0]).show(ctx, |ui| {
+                    egui::Frame::window(ui.style()).rounding(20.0).fill(egui::Color32::from_black_alpha(180)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if ui.button("📁 1").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr"]).pick_file() {
+                                    load_path = Some((p, 0));
+                                }
+                            }
+                            if ui.button("📁 2").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr"]).pick_file() {
+                                    load_path = Some((p, 1));
+                                }
+                            }
+                            ui.separator();
+                            let mut current = self.current_panorama;
+                            if ui.selectable_value(&mut current, 0, "Image 1").clicked() { self.current_panorama = 0; }
+                            if ui.selectable_value(&mut current, 1, "Image 2").clicked() { self.current_panorama = 1; }
+                            ui.separator();
+                            if ui.button("⟲ Reset").clicked() { reset = true; }
+                            if ui.button("💾 Save").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp"]).set_file_name("view.png").save_file() {
+                                    self.capture_path = Some(p);
+                                }
+                            }
+                            ui.separator();
+                            let mut two_point = self.uniforms.two_point_mode == 1;
+                            if ui.checkbox(&mut two_point, "2-Point").changed() {
+                                self.uniforms.two_point_mode = if two_point { 1 } else { 0 };
+                                if two_point { self.uniforms.pitch = 0.0; } else { self.uniforms.shift = 0.0; }
+                                update_uniforms = true;
+                            }
+                            ui.separator();
+                            ui.label("FOV:");
+                            let mut fov = self.uniforms.fov;
+                            if ui.add(egui::Slider::new(&mut fov, 5.0..=150.0).suffix("°")).changed() { new_fov = Some(fov); }
+                            ui.separator();
+                            ui.label("Exposure:");
+                            let mut exposure = self.uniforms.exposure;
+                            if ui.add(egui::Slider::new(&mut exposure, -30.0..=10.0).suffix(" EV")).changed() { new_exposure = Some(exposure); }
+                            ui.separator();
+                            ui.label("Gamma:");
+                            let mut gamma = self.uniforms.gamma;
+                            if ui.add(egui::Slider::new(&mut gamma, 0.5..=3.0)).changed() { new_gamma = Some(gamma); }
+                        });
                     });
+                });
             }
         });
 
-        // Apply changes after egui context is released
-        if let Some(p) = load_path {
-            self.start_loading_image(p);
-        }
-        if reset {
-            self.uniforms = Uniforms::default();
-            self.update_uniforms();
-        }
-        if let Some(fov) = new_fov {
-            self.uniforms.fov = fov;
-            self.update_uniforms();
-        }
-        if let Some(exposure) = new_exposure {
-            self.uniforms.exposure = exposure;
-            self.update_uniforms();
-        }
-        if let Some(gamma) = new_gamma {
-            self.uniforms.gamma = gamma;
-            self.update_uniforms();
-        }
-        if update_uniforms {
-            self.update_uniforms();
-        }
+        if let Some((p, slot)) = load_path { self.start_loading_image(p, slot); }
+        if reset { self.uniforms = Uniforms::default(); self.update_uniforms(); }
+        if let Some(fov) = new_fov { self.uniforms.fov = fov; self.update_uniforms(); }
+        if let Some(exposure) = new_exposure { self.uniforms.exposure = exposure; self.update_uniforms(); }
+        if let Some(gamma) = new_gamma { self.uniforms.gamma = gamma; self.update_uniforms(); }
+        if update_uniforms { self.update_uniforms(); }
 
-        // Store shapes and pixels_per_point for tessellation in render()
         self.egui_shapes = full_output.shapes;
         self.egui_pixels_per_point = full_output.pixels_per_point;
-
-        // Update egui textures (fonts, icons, etc.)
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
-        }
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
-
-        self.egui_state
-            .handle_platform_output(&self.window, full_output.platform_output);
+        for (id, image_delta) in &full_output.textures_delta.set { self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta); }
+        for id in &full_output.textures_delta.free { self.egui_renderer.free_texture(id); }
+        self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
     }
 
     pub fn on_event(&mut self, event: &WindowEvent) {

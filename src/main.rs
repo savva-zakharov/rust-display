@@ -25,17 +25,40 @@ fn main() {
                         if event.state == ElementState::Pressed {
                             match event.physical_key {
                                 PhysicalKey::Code(KeyCode::KeyO) => {
-                                    if let Some(p) = rfd::FileDialog::new()
-                                        .add_filter(
-                                            "Images",
-                                            &[
-                                                "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff",
-                                                "exr",
-                                            ],
-                                        )
-                                        .pick_file()
-                                    {
-                                        app.start_loading_image(p);
+                                    if !app.egui_ctx.wants_keyboard_input() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .add_filter(
+                                                "Images",
+                                                &[
+                                                    "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff",
+                                                    "exr",
+                                                ],
+                                            )
+                                            .pick_file()
+                                        {
+                                            app.start_loading_image(p, 0);
+                                        }
+                                    }
+                                }
+                                PhysicalKey::Code(KeyCode::KeyP) => {
+                                    if !app.egui_ctx.wants_keyboard_input() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .add_filter(
+                                                "Images",
+                                                &[
+                                                    "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff",
+                                                    "exr",
+                                                ],
+                                            )
+                                            .pick_file()
+                                        {
+                                            app.start_loading_image(p, 1);
+                                        }
+                                    }
+                                }
+                                PhysicalKey::Code(KeyCode::KeyS) => {
+                                    if !app.egui_ctx.wants_keyboard_input() {
+                                        app.current_panorama = 1 - app.current_panorama;
                                     }
                                 }
                                 PhysicalKey::Code(KeyCode::Escape) => app.should_close = true,
