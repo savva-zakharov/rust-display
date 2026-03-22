@@ -47,6 +47,7 @@ pub struct App {
     pub is_loading: bool,
     image_sender: Sender<Result<(Vec<u16>, Vec<u16>, u32, u32, PathBuf), String>>,
     image_receiver: Receiver<Result<(Vec<u16>, Vec<u16>, u32, u32, PathBuf), String>>,
+    pub capture_path: Option<PathBuf>,
 }
 
 impl App {
@@ -293,6 +294,7 @@ impl App {
             is_loading: false,
             image_sender: tx,
             image_receiver: rx,
+            capture_path: None,
         }
     }
 
@@ -529,10 +531,15 @@ impl App {
             bytemuck::cast_slice(&[self.uniforms]),
         );
 
+        let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if self.capture_path.is_some() {
+            usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+
         self.surface.configure(
             &self.device,
             &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage,
                 format: self.surface_format,
                 width: size.width,
                 height: size.height,
@@ -582,6 +589,46 @@ impl App {
             }
         }
 
+        let capture_info = if let Some(path) = self.capture_path.take() {
+            let u32_size = std::mem::size_of::<u32>() as u32;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let unpadded_bytes_per_row = u32_size * size.width;
+            let padding = (align - unpadded_bytes_per_row % align) % align;
+            let padded_bytes_per_row = unpadded_bytes_per_row + padding;
+
+            let capture_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Capture Buffer"),
+                size: (padded_bytes_per_row * size.height) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            enc.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &capture_buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: Some(size.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: size.width,
+                    height: size.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Some((path, capture_buffer, padded_bytes_per_row))
+        } else {
+            None
+        };
+
         // Render egui on top
         let clipped_primitives = self
             .egui_ctx
@@ -625,6 +672,59 @@ impl App {
         }
 
         self.queue.submit(std::iter::once(enc.finish()));
+
+        if let Some((path, capture_buffer, padded_bytes_per_row)) = capture_info {
+            let buffer_slice = capture_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |res| tx.send(res).unwrap());
+            self.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+
+            let data = buffer_slice.get_mapped_range().to_vec();
+            let width = size.width;
+            let height = size.height;
+            let format = self.surface_format;
+            let u32_size = std::mem::size_of::<u32>() as usize;
+
+            thread::spawn(move || {
+                let mut png_data = Vec::with_capacity((width * height * 3) as usize);
+                for y in 0..height {
+                    for x in 0..width {
+                        let i = (y as usize * padded_bytes_per_row as usize + x as usize * u32_size);
+                        let r; let g; let b;
+                        match format {
+                            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm => {
+                                r = data[i + 2];
+                                g = data[i + 1];
+                                b = data[i];
+                            }
+                            wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Rgba8Unorm => {
+                                r = data[i];
+                                g = data[i + 1];
+                                b = data[i + 2];
+                            }
+                            _ => {
+                                r = data[i];
+                                g = data[i + 1];
+                                b = data[i + 2];
+                            }
+                        }
+                        png_data.push(r);
+                        png_data.push(g);
+                        png_data.push(b);
+                    }
+                }
+                image::save_buffer(
+                    &path,
+                    &png_data,
+                    width,
+                    height,
+                    image::ColorType::Rgb8,
+                ).unwrap();
+                println!("View saved to {:?}", path);
+            });
+        }
+
         frame.present();
     }
 
@@ -676,6 +776,15 @@ impl App {
                                     }
                                     if ui.button("⟲ Reset").clicked() {
                                         reset = true;
+                                    }
+                                    if ui.button("💾 Save").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
+                                            .set_file_name("view.png")
+                                            .save_file()
+                                        {
+                                            self.capture_path = Some(p);
+                                        }
                                     }
                                     ui.separator();
                                     let mut two_point = self.uniforms.two_point_mode == 1;
