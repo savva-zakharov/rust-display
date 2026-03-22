@@ -1,5 +1,6 @@
 use crate::shader;
 use crate::uniforms::Uniforms;
+use crate::luts::{self, Lut};
 use half::f16;
 use image::GenericImageView;
 use std::path::PathBuf;
@@ -45,6 +46,11 @@ pub struct App {
     image_sender: Sender<Result<(Vec<u16>, u32, u32, PathBuf, usize), String>>,
     image_receiver: Receiver<Result<(Vec<u16>, u32, u32, PathBuf, usize), String>>,
     pub capture_path: Option<PathBuf>,
+    pub luts: Vec<PathBuf>,
+    pub current_lut: Option<usize>,
+    lut_texture: Option<wgpu::Texture>,
+    lut_view: Option<wgpu::TextureView>,
+    lut_sampler: wgpu::Sampler,
 }
 
 impl App {
@@ -104,6 +110,15 @@ impl App {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("LUT Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("UB"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -126,6 +141,22 @@ impl App {
             view_formats: &[],
         });
         let pv = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let lut_placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("LUT Placeholder"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 2,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let lv = lut_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("BGL"),
@@ -156,6 +187,22 @@ impl App {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -175,6 +222,14 @@ impl App {
                     binding: 2,
                     resource: ub.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&lv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&lut_sampler),
+                },
             ],
         });
         let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -192,6 +247,14 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: ub.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&lv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&lut_sampler),
                 },
             ],
         });
@@ -244,6 +307,7 @@ impl App {
         });
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, sf, None, 1);
+        let available_luts = luts::list_luts();
 
         Self {
             window,
@@ -277,6 +341,11 @@ impl App {
             image_sender: tx,
             image_receiver: rx,
             capture_path: None,
+            luts: available_luts,
+            current_lut: None,
+            lut_texture: Some(lut_placeholder),
+            lut_view: Some(lv),
+            lut_sampler,
         }
     }
 
@@ -371,19 +440,87 @@ impl App {
         self.current_panorama = slot;
     }
 
+    pub fn set_lut(&mut self, index: Option<usize>) {
+        self.current_lut = index;
+        if let Some(idx) = index {
+            let path = &self.luts[idx];
+            let file_name = path.file_name().unwrap().to_string_lossy();
+            if file_name.contains("AgX") {
+                self.uniforms.lut_type = 1;
+            } else {
+                self.uniforms.lut_type = 0;
+            }
+            match Lut::load_cube(path) {
+                Ok(lut) => {
+                    self.upload_lut_texture(&lut);
+                    self.uniforms.use_lut = 1;
+                }
+                Err(e) => {
+                    eprintln!("Failed to load LUT: {}", e);
+                    self.uniforms.use_lut = 0;
+                }
+            }
+        } else {
+            self.uniforms.use_lut = 0;
+            self.uniforms.lut_type = 0;
+        }
+        self.update_uniforms();
+        self.recreate_bind_groups();
+    }
+
+    fn upload_lut_texture(&mut self, lut: &Lut) {
+        let size = lut.size;
+        let mut rgba_data = Vec::with_capacity((size * size * size * 4) as usize);
+        for i in 0..(size * size * size) as usize {
+            rgba_data.push(f16::from_f32(lut.data[i * 3]).to_bits());
+            rgba_data.push(f16::from_f32(lut.data[i * 3 + 1]).to_bits());
+            rgba_data.push(f16::from_f32(lut.data[i * 3 + 2]).to_bits());
+            rgba_data.push(f16::from_f32(1.0).to_bits());
+        }
+
+        self.lut_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("LUT Texture"),
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        }));
+        let t = self.lut_texture.as_ref().unwrap();
+        self.lut_view = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&rgba_data),
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(8 * size), rows_per_image: Some(size) },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size },
+        );
+    }
+
     fn recreate_bind_groups(&mut self) {
         for i in 0..2 {
-            if let Some(tv) = &self.panorama_views[i] {
-                self.bind_groups[i] = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("BG {}", i)),
-                    layout: &self.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(tv) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                        wgpu::BindGroupEntry { binding: 2, resource: self.uniform_buffer.as_entire_binding() },
-                    ],
-                }));
-            }
+            let panorama_view = if let Some(v) = &self.panorama_views[i] { v } else {
+                // If we don't have a view yet, we should use the placeholder view.
+                // But wait, where is the placeholder view? It was local to App::new.
+                // I should probably store it or just skip if None, 
+                // but since App::new initializes them, it's better to ensure we always have something.
+                continue;
+            };
+            let lut_view = self.lut_view.as_ref().expect("LUT view must be initialized");
+
+            self.bind_groups[i] = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("BG {}", i)),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(panorama_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.uniform_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lut_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.lut_sampler) },
+                ],
+            }));
         }
     }
 
@@ -490,7 +627,7 @@ impl App {
                 let mut png_data = Vec::with_capacity((width * height * 3) as usize);
                 for y in 0..height {
                     for x in 0..width {
-                        let i = (y as usize * padded_bytes_per_row as usize + x as usize * u32_size);
+                        let i = y as usize * padded_bytes_per_row as usize + x as usize * u32_size;
                         let r; let g; let b;
                         match format {
                             wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm => { r = data[i + 2]; g = data[i + 1]; b = data[i]; }
@@ -513,6 +650,7 @@ impl App {
         let mut new_exposure: Option<f32> = None;
         let mut new_gamma: Option<f32> = None;
         let mut update_uniforms = false;
+        let mut selected_lut = self.current_lut;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if self.is_loading {
@@ -563,11 +701,31 @@ impl App {
                             ui.label("Gamma:");
                             let mut gamma = self.uniforms.gamma;
                             if ui.add(egui::Slider::new(&mut gamma, 0.5..=3.0)).changed() { new_gamma = Some(gamma); }
+                            ui.separator();
+                            ui.label("LUT:");
+                            let lut_name = if let Some(idx) = selected_lut {
+                                self.luts[idx].file_name().unwrap().to_string_lossy().to_string()
+                            } else {
+                                "None".to_string()
+                            };
+                            egui::ComboBox::from_id_source("lut_select")
+                                .selected_text(lut_name)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut selected_lut, None, "None");
+                                    for (i, path) in self.luts.iter().enumerate() {
+                                        let name = path.file_name().unwrap().to_string_lossy();
+                                        ui.selectable_value(&mut selected_lut, Some(i), name);
+                                    }
+                                });
                         });
                     });
                 });
             }
         });
+
+        if selected_lut != self.current_lut {
+            self.set_lut(selected_lut);
+        }
 
         if let Some((p, slot)) = load_path { self.start_loading_image(p, slot); }
         if reset { self.uniforms = Uniforms::default(); self.update_uniforms(); }

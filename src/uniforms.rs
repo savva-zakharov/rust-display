@@ -11,6 +11,8 @@ pub struct Uniforms {
     pub gamma: f32,
     pub shift: f32,
     pub two_point_mode: u32,
+    pub use_lut: u32,
+    pub lut_type: u32, // 0 = linear, 1 = AgX Log
 }
 impl Default for Uniforms {
     fn default() -> Self {
@@ -23,6 +25,8 @@ impl Default for Uniforms {
             gamma: 1.0,
             shift: 0.0,
             two_point_mode: 0,
+            use_lut: 0,
+            lut_type: 0,
         }
     }
 }

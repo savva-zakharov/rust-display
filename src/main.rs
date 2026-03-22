@@ -1,6 +1,7 @@
 mod app;
 mod shader;
 mod uniforms;
+mod luts;
 
 use app::App;
 use winit::event::{ElementState, Event, MouseScrollDelta, WindowEvent};
@@ -59,6 +60,28 @@ fn main() {
                                 PhysicalKey::Code(KeyCode::KeyS) => {
                                     if !app.egui_ctx.wants_keyboard_input() {
                                         app.current_panorama = 1 - app.current_panorama;
+                                    }
+                                }
+                                PhysicalKey::Code(KeyCode::BracketLeft) => {
+                                    if !app.egui_ctx.wants_keyboard_input() {
+                                        let len = app.luts.len();
+                                        let next = match app.current_lut {
+                                            None => if len > 0 { Some(len - 1) } else { None },
+                                            Some(0) => None,
+                                            Some(i) => Some(i - 1),
+                                        };
+                                        app.set_lut(next);
+                                    }
+                                }
+                                PhysicalKey::Code(KeyCode::BracketRight) => {
+                                    if !app.egui_ctx.wants_keyboard_input() {
+                                        let len = app.luts.len();
+                                        let next = match app.current_lut {
+                                            None => if len > 0 { Some(0) } else { None },
+                                            Some(i) if i + 1 < len => Some(i + 1),
+                                            _ => None,
+                                        };
+                                        app.set_lut(next);
                                     }
                                 }
                                 PhysicalKey::Code(KeyCode::Escape) => app.should_close = true,
