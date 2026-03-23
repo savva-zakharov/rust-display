@@ -3,7 +3,20 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
-struct Uniforms { yaw: f32, pitch: f32, fov: f32, aspect: f32, exposure: f32, gamma: f32, shift: f32, two_point_mode: u32, use_lut: u32, lut_type: u32 };
+struct Uniforms { 
+    yaw: f32, 
+    pitch: f32, 
+    fov: f32, 
+    aspect: f32, 
+    exposure: f32, 
+    gamma: f32, 
+    shift: f32, 
+    two_point_mode: u32, 
+    use_lut: u32, 
+    lut_type: u32,
+    _padding1: u32,
+    _padding2: u32,
+};
 @group(0) @binding(0) var panorama_texture: texture_2d<f32>;
 @group(0) @binding(1) var panorama_sampler: sampler;
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;

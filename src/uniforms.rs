@@ -13,6 +13,7 @@ pub struct Uniforms {
     pub two_point_mode: u32,
     pub use_lut: u32,
     pub lut_type: u32, // 0 = linear, 1 = AgX Log
+    pub _padding: [u32; 2],
 }
 impl Default for Uniforms {
     fn default() -> Self {
@@ -27,6 +28,7 @@ impl Default for Uniforms {
             two_point_mode: 0,
             use_lut: 0,
             lut_type: 0,
+            _padding: [0, 0],
         }
     }
 }

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>360° Panorama Viewer - Library</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a1a;
+        }
+        canvas {
+            display: block;
+            width: 100% !important;
+            height: 100% !important;
+        }
+    </style>
+</head>
+<body>
+    <script type="module">
+        import init from './pkg/rust_display.js';
+        
+        // Add images to query string if not present
+        const url = new URL(window.location.href);
+        if (!url.searchParams.has('img1')) {
+            url.searchParams.set('img1', 'hdri/Library_02_o_hdr_4k_integration.jpg');
+            url.searchParams.set('img2', 'hdri/Library_02_o_hdr_4k.jpg');
+            window.history.replaceState({}, '', url);
+        }
+
+        init().catch((error) => {
+            if (!error.message.startsWith("Using exceptions for control flow,")) {
+                throw error;
+            }
+        });
+    </script>
+</body>
+</html>

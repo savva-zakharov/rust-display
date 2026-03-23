@@ -13,6 +13,15 @@ use winit::window::Window;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+
+
+#[allow(dead_code)]
+pub enum LoadResult {
+    Image(Vec<u16>, u32, u32, PathBuf, usize),
+    Lut(Vec<u8>, String),
+}
 
 pub struct App {
     pub window: Arc<Window>,
@@ -43,8 +52,8 @@ pub struct App {
     egui_shapes: Vec<egui::epaint::ClippedShape>,
     egui_pixels_per_point: f32,
     pub is_loading: bool,
-    image_sender: Sender<Result<(Vec<u16>, u32, u32, PathBuf, usize), String>>,
-    image_receiver: Receiver<Result<(Vec<u16>, u32, u32, PathBuf, usize), String>>,
+    pub image_sender: Sender<Result<LoadResult, String>>,
+    image_receiver: Receiver<Result<LoadResult, String>>,
     pub capture_path: Option<PathBuf>,
     pub luts: Vec<PathBuf>,
     pub current_lut: Option<usize>,
@@ -59,13 +68,29 @@ impl App {
         let window = Arc::new(Window::new(event_loop).unwrap());
         window.set_title("360° Panorama Viewer");
 
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::WindowExtWebSys;
+            web_sys::window()
+                .and_then(|win| win.document())
+                .and_then(|doc| doc.body())
+                .and_then(|body| {
+                    let canvas = web_sys::Element::from(window.canvas().unwrap());
+                    body.append_child(&canvas).ok()
+                })
+                .expect("Couldn't append canvas to document body.");
+        }
+
         // Set window icon
-        let icon_bytes = include_bytes!("../icons/app_icon.png");
-        if let Ok(icon_image) = image::load_from_memory(icon_bytes) {
-            let icon_rgba = icon_image.to_rgba8();
-            let (width, height) = icon_rgba.dimensions();
-            if let Ok(icon) = winit::window::Icon::from_rgba(icon_rgba.into_raw(), width, height) {
-                window.set_window_icon(Some(icon));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let icon_bytes = include_bytes!("../icons/app_icon.png");
+            if let Ok(icon_image) = image::load_from_memory(icon_bytes) {
+                let icon_rgba = icon_image.to_rgba8();
+                let (width, height) = icon_rgba.dimensions();
+                if let Ok(icon) = winit::window::Icon::from_rgba(icon_rgba.into_raw(), width, height) {
+                    window.set_window_icon(Some(icon));
+                }
             }
         }
 
@@ -89,7 +114,11 @@ impl App {
             .await
             .expect("No adapter");
 
-        let mut limits = wgpu::Limits::default();
+        let mut limits = if cfg!(target_arch = "wasm32") {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            wgpu::Limits::default()
+        };
         let adapter_limits = adapter.limits();
         limits.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d;
         println!("Adapter max texture size: {}", limits.max_texture_dimension_2d);
@@ -359,12 +388,40 @@ impl App {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_image_from_url(&mut self, url: String, slot: usize) {
+        let sender = self.image_sender.clone();
+        self.is_loading = true;
+        wasm_bindgen_futures::spawn_local(async move {
+            let window = web_sys::window().unwrap();
+            let resp_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&url)).await;
+            
+            if let Ok(resp_value) = resp_value {
+                let resp: web_sys::Response = resp_value.dyn_into().unwrap();
+                if resp.ok() {
+                    let array_buffer_value = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().unwrap()).await.unwrap();
+                    let array_buffer = js_sys::ArrayBuffer::from(array_buffer_value);
+                    let uint8_array = js_sys::Uint8Array::new(&array_buffer);
+                    let data = uint8_array.to_vec();
+                    
+                    let path = std::path::PathBuf::from(url);
+                    let result = App::load_image_data_from_memory(&data, path, 4096, slot)
+                        .map(|(data, w, h, path, slot)| LoadResult::Image(data, w, h, path, slot));
+                    sender.send(result).unwrap();
+                    return;
+                }
+            }
+            let _ = sender.send(Err(format!("Failed to fetch image from {}", url)));
+        });
+    }
+
     pub fn start_loading_image(&mut self, path: PathBuf, slot: usize) {
         self.is_loading = true;
         let sender = self.image_sender.clone();
         let max_size = self.device.limits().max_texture_dimension_2d;
         thread::spawn(move || {
-            let result = App::load_image_data(&path, max_size, slot);
+            let result = App::load_image_data(&path, max_size, slot)
+                .map(|(data, w, h, path, slot)| LoadResult::Image(data, w, h, path, slot));
             sender.send(result).unwrap();
         });
     }
@@ -374,18 +431,51 @@ impl App {
             if let Ok(result) = self.image_receiver.try_recv() {
                 self.is_loading = false;
                 match result {
-                    Ok((f16_data, w, h, path, slot)) => {
+                    Ok(LoadResult::Image(f16_data, w, h, path, slot)) => {
                         self.upload_hdr_from_data(&f16_data, w, h, slot);
                         if let Some(file_name) = path.file_name() {
                             self.window.set_title(&file_name.to_string_lossy());
                         }
                     }
+                    Ok(LoadResult::Lut(data, name)) => {
+                        self.set_lut_from_data(&data, name);
+                    }
                     Err(e) => {
-                        eprintln!("Failed to load image: {}", e);
+                        eprintln!("Failed to load: {}", e);
                     }
                 }
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn load_image_data_from_memory(data: &[u8], path: PathBuf, max_size: u32, slot: usize) -> Result<(Vec<u16>, u32, u32, PathBuf, usize), String> {
+        let img = match image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?
+            .decode()
+        {
+            Ok(img) => img,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let (orig_w, orig_h) = img.dimensions();
+        let img = if orig_w > max_size || orig_h > max_size {
+            let s = max_size as f32 / orig_w.max(orig_h) as f32;
+            let (nw, nh) = ((orig_w as f32 * s) as u32, (orig_h as f32 * s) as u32);
+            img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+
+        let (w, h) = img.dimensions();
+        let rgba32f = img.to_rgba32f();
+        let f16_data: Vec<u16> = rgba32f
+            .pixels()
+            .flat_map(|p| p.0.iter().map(|&v| f16::from_f32(v).to_bits()))
+            .collect();
+
+        Ok((f16_data, w, h, path, slot))
     }
 
     fn load_image_data(path: &PathBuf, max_size: u32, slot: usize) -> Result<(Vec<u16>, u32, u32, PathBuf, usize), String> {
@@ -448,6 +538,29 @@ impl App {
         self.recreate_bind_groups();
         self.image_loaded[slot] = true;
         self.current_panorama = slot;
+    }
+
+    pub fn set_lut_from_data(&mut self, data: &[u8], name: String) {
+        if name.contains("AgX") {
+            self.uniforms.lut_type = 1;
+        } else {
+            self.uniforms.lut_type = 0;
+        }
+        match Lut::load_cube_from_memory(data) {
+            Ok(lut) => {
+                self.upload_lut_texture(&lut);
+                self.uniforms.use_lut = 1;
+                // For wasm, we don't have a path, so we just add it to luts to keep index valid if needed
+                // but better just update current_lut to None or a special value.
+                self.current_lut = None; 
+            }
+            Err(e) => {
+                eprintln!("Failed to load LUT: {}", e);
+                self.uniforms.use_lut = 0;
+            }
+        }
+        self.update_uniforms();
+        self.recreate_bind_groups();
     }
 
     pub fn set_lut(&mut self, index: Option<usize>) {
@@ -668,26 +781,91 @@ impl App {
             }
             if self.show_controls {
                 egui::Area::new(egui::Id::new("controls")).anchor(egui::Align2::CENTER_TOP, [0.0, 20.0]).show(ctx, |ui| {
-                    egui::Frame::window(ui.style()).rounding(20.0).fill(egui::Color32::from_black_alpha(180)).show(ui, |ui| {
+                    egui::Frame::window(ui.style())
+                        .rounding(20.0)
+                        .fill(egui::Color32::from_black_alpha(220))
+                        .shadow(egui::epaint::Shadow::NONE)
+                        .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
+                            ui.separator();
                             if ui.button("📁 1").clicked() {
+                                #[cfg(not(target_arch = "wasm32"))]
                                 if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr"]).pick_file() {
                                     load_path = Some((p, 0));
                                 }
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    let sender = self.image_sender.clone();
+                                    self.is_loading = true;
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        if let Some(file) = rfd::AsyncFileDialog::new()
+                                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr"])
+                                            .pick_file()
+                                            .await
+                                        {
+                                            let data = file.read().await;
+                                            let path = std::path::PathBuf::from(file.file_name());
+                                            let result = App::load_image_data_from_memory(&data, path, 4096, 0)
+                                                .map(|(data, w, h, path, slot)| LoadResult::Image(data, w, h, path, slot));
+                                            sender.send(result).unwrap();
+                                        } else {
+                                            // Reset loading state if cancelled
+                                            let _ = sender.send(Err("Cancelled".to_string()));
+                                        }
+                                    });
+                                }
                             }
                             if ui.button("📁 2").clicked() {
+                                #[cfg(not(target_arch = "wasm32"))]
                                 if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr"]).pick_file() {
                                     load_path = Some((p, 1));
                                 }
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    let sender = self.image_sender.clone();
+                                    self.is_loading = true;
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        if let Some(file) = rfd::AsyncFileDialog::new()
+                                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr"])
+                                            .pick_file()
+                                            .await
+                                        {
+                                            let data = file.read().await;
+                                            let path = std::path::PathBuf::from(file.file_name());
+                                            let result = App::load_image_data_from_memory(&data, path, 4096, 1)
+                                                .map(|(data, w, h, path, slot)| LoadResult::Image(data, w, h, path, slot));
+                                            sender.send(result).unwrap();
+                                        } else {
+                                            // Reset loading state if cancelled
+                                            let _ = sender.send(Err("Cancelled".to_string()));
+                                        }
+                                    });
+                                }
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            if ui.button("📁 L").clicked() {
+                                let sender = self.image_sender.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Some(file) = rfd::AsyncFileDialog::new()
+                                        .add_filter("LUTs", &["cube"])
+                                        .pick_file()
+                                        .await
+                                    {
+                                        let data = file.read().await;
+                                        let name = file.file_name();
+                                        sender.send(Ok(LoadResult::Lut(data, name))).unwrap();
+                                    }
+                                });
                             }
                             ui.separator();
                             let mut current = self.current_panorama;
-                            if ui.selectable_value(&mut current, 0, "Image 1").clicked() { self.current_panorama = 0; }
-                            if ui.selectable_value(&mut current, 1, "Image 2").clicked() { self.current_panorama = 1; }
+                            if ui.selectable_value(&mut current, 0, "1").clicked() { self.current_panorama = 0; }
+                            if ui.selectable_value(&mut current, 1, "2").clicked() { self.current_panorama = 1; }
                             ui.separator();
-                            if ui.button("⟲ Reset").clicked() { reset = true; }
-                            if ui.button("💾 Save").clicked() {
+                            if ui.button("⟲").clicked() { reset = true; }
+                            if ui.button("💾").clicked() {
+                                #[cfg(not(target_arch = "wasm32"))]
                                 if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp"]).set_file_name("view.png").save_file() {
                                     self.capture_path = Some(p);
                                 }
@@ -727,6 +905,7 @@ impl App {
                                         ui.selectable_value(&mut selected_lut, Some(i), name);
                                     }
                                 });
+                            ui.separator();
                         });
                     });
                 });
